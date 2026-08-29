@@ -2,6 +2,10 @@ import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/db";
 import { entryIntents, webhookEvents } from "@/db/schema";
+import {
+  DodoWebhookVerificationError,
+  verifyDodoWebhookPayload,
+} from "@/lib/dodo-webhook-verify";
 import { fulfillPaidIntent } from "@/lib/entries";
 
 export const dynamic = "force-dynamic";
@@ -63,25 +67,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const { Webhooks } = await import("@dodopayments/nextjs");
+  const rawBody = await request.text();
+  try {
+    const payload = verifyDodoWebhookPayload(
+      rawBody,
+      {
+        "webhook-id": request.headers.get("webhook-id"),
+        "webhook-timestamp": request.headers.get("webhook-timestamp"),
+        "webhook-signature": request.headers.get("webhook-signature"),
+      },
+      webhookKey,
+    ) as PaymentPayload;
 
-  return Webhooks({
-    webhookKey,
-    onPayload: async (payload) => {
-      const eventId = `${payload.business_id}:${payload.type}:${payload.timestamp}`;
-      const first = await rememberEvent(eventId, payload.type);
-      if (!first) return;
-      if (payload.type === "payment.succeeded") {
-        const data = payload.data as {
-          payment_id?: string;
-          total_amount?: number;
-          metadata?: { intentId?: string };
-        };
-        await handlePaymentSucceeded({
-          type: payload.type,
-          data,
-        });
-      }
-    },
-  })(request);
+    const eventId = `${payload.business_id}:${payload.type}:${payload.timestamp}`;
+    const first = await rememberEvent(eventId, payload.type ?? "unknown");
+    if (!first) {
+      return new NextResponse(null, { status: 200 });
+    }
+    if (payload.type === "payment.succeeded") {
+      await handlePaymentSucceeded(payload);
+    }
+    return new NextResponse(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof DodoWebhookVerificationError) {
+      return new NextResponse(error.message, { status: 401 });
+    }
+    throw error;
+  }
 }
